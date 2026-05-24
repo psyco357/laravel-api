@@ -11,6 +11,7 @@ use App\Services\JwtService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Symfony\Component\HttpFoundation\Response;
 use App\Helpers\LogActivity;
@@ -182,6 +183,211 @@ class AuthController extends Controller
         ]);
     }
 
+    public function getActivityLogs(Request $request): JsonResponse
+    {
+        $user = Auth::guard('api')->user();
+
+        if (!$user) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. Token tidak valid atau expired.',
+            ], Response::HTTP_UNAUTHORIZED);
+        }
+
+        if (!$this->canAccessLogs($user->role ?? null)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Forbidden. Only admin can access activity logs.',
+            ], Response::HTTP_FORBIDDEN);
+        }
+
+        $perPage = max(1, min((int) $request->get('per_page', 15), 100));
+        $sortBy = in_array($request->get('sort_by'), ['created_at', 'action', 'module', 'ip_address'], true)
+            ? $request->get('sort_by')
+            : 'created_at';
+        $sortOrder = strtolower((string) $request->get('sort_order', 'desc')) === 'asc' ? 'asc' : 'desc';
+
+        $query = $this->authActivityLogsQuery();
+
+        if ($request->filled('user_id')) {
+            $query->where('logs.user_id', (int) $request->get('user_id'));
+        }
+
+        if ($request->filled('action')) {
+            $query->where('logs.action', (string) $request->get('action'));
+        }
+
+        if ($request->filled('ip_address')) {
+            $query->where('logs.ip_address', 'like', '%' . trim((string) $request->get('ip_address')) . '%');
+        }
+
+        if ($request->filled('date_from')) {
+            $query->whereDate('logs.created_at', '>=', (string) $request->get('date_from'));
+        }
+
+        if ($request->filled('date_to')) {
+            $query->whereDate('logs.created_at', '<=', (string) $request->get('date_to'));
+        }
+
+        if ($request->filled('search')) {
+            $search = trim((string) $request->get('search'));
+
+            $query->where(function ($builder) use ($search) {
+                $builder->where('logs.action', 'like', "%{$search}%")
+                    ->orWhere('logs.module', 'like', "%{$search}%")
+                    ->orWhere('logs.ip_address', 'like', "%{$search}%")
+                    ->orWhere('users.username', 'like', "%{$search}%")
+                    ->orWhere('users.email', 'like', "%{$search}%")
+                    ->orWhere('profiles.full_name', 'like', "%{$search}%");
+            });
+        }
+
+        $logs = $query
+            ->select([
+                'logs.id',
+                'logs.user_id',
+                'logs.action',
+                'logs.module',
+                'logs.payload',
+                'logs.ip_address',
+                'logs.created_at',
+                'logs.updated_at',
+                'users.username',
+                'users.email',
+                'profiles.full_name',
+            ])
+            ->orderBy('logs.' . $sortBy, $sortOrder)
+            ->paginate($perPage)
+            ->appends($request->query());
+
+        $logs->getCollection()->transform(function (object $log) {
+            $payload = null;
+
+            if (is_string($log->payload) && $log->payload !== '') {
+                $decoded = json_decode($log->payload, true);
+                $payload = is_array($decoded) ? $decoded : null;
+            }
+
+            return [
+                'id' => $log->id,
+                'action' => $log->action,
+                'module' => $log->module,
+                'ip_address' => $log->ip_address,
+                'created_at' => $log->created_at,
+                'updated_at' => $log->updated_at,
+                'payload' => $payload,
+                'user' => $log->user_id === null ? null : [
+                    'id' => $log->user_id,
+                    'username' => $log->username,
+                    'email' => $log->email,
+                    'full_name' => $log->full_name,
+                ],
+            ];
+        });
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Activity logs retrieved successfully',
+            'data' => $logs->items(),
+            'meta' => [
+                'current_page' => $logs->currentPage(),
+                'last_page' => $logs->lastPage(),
+                'per_page' => $logs->perPage(),
+                'total' => $logs->total(),
+            ],
+            'filters' => [
+                'search' => $request->get('search'),
+                'user_id' => $request->get('user_id'),
+                'action' => $request->get('action'),
+                'ip_address' => $request->get('ip_address'),
+                'date_from' => $request->get('date_from'),
+                'date_to' => $request->get('date_to'),
+            ],
+        ]);
+    }
+
+    public function getActivitySummary(Request $request): JsonResponse
+    {
+        $user = Auth::guard('api')->user();
+
+        if (!$user) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized. Token tidak valid atau expired.',
+            ], Response::HTTP_UNAUTHORIZED);
+        }
+
+        if (!$this->canAccessLogs($user->role ?? null)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Forbidden. Only admin can access activity logs.',
+            ], Response::HTTP_FORBIDDEN);
+        }
+
+        $baseQuery = $this->authActivityLogsQuery();
+        $totalLogs = (clone $baseQuery)->count();
+        $todayLogs = (clone $baseQuery)->whereDate('logs.created_at', today())->count();
+        $last7DaysLogs = (clone $baseQuery)->where('logs.created_at', '>=', now()->subDays(7))->count();
+        $uniqueUsers = (clone $baseQuery)->whereNotNull('logs.user_id')->distinct('logs.user_id')->count('logs.user_id');
+        $uniqueIpAddresses = (clone $baseQuery)->whereNotNull('logs.ip_address')->distinct('logs.ip_address')->count('logs.ip_address');
+
+        $actions = (clone $baseQuery)
+            ->select('logs.action', DB::raw('COUNT(*) as total'))
+            ->groupBy('logs.action')
+            ->orderByDesc('total')
+            ->get();
+
+        $dailyActivity = (clone $baseQuery)
+            ->selectRaw('DATE(logs.created_at) as activity_date, COUNT(*) as total')
+            ->where('logs.created_at', '>=', now()->subDays(6)->startOfDay())
+            ->groupBy(DB::raw('DATE(logs.created_at)'))
+            ->orderBy('activity_date')
+            ->get();
+
+        $topUsers = (clone $baseQuery)
+            ->whereNotNull('logs.user_id')
+            ->select([
+                'logs.user_id',
+                'users.username',
+                'users.email',
+                'profiles.full_name',
+                DB::raw('COUNT(*) as total'),
+            ])
+            ->groupBy('logs.user_id', 'users.username', 'users.email', 'profiles.full_name')
+            ->orderByDesc('total')
+            ->limit(5)
+            ->get();
+
+        $latestLog = (clone $baseQuery)
+            ->select([
+                'logs.id',
+                'logs.action',
+                'logs.module',
+                'logs.ip_address',
+                'logs.created_at',
+                'users.username',
+                'profiles.full_name',
+            ])
+            ->orderByDesc('logs.created_at')
+            ->first();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Activity log summary retrieved successfully',
+            'data' => [
+                'total_logs' => $totalLogs,
+                'today_logs' => $todayLogs,
+                'last_7_days_logs' => $last7DaysLogs,
+                'unique_users' => $uniqueUsers,
+                'unique_ip_addresses' => $uniqueIpAddresses,
+                'actions' => $actions,
+                'daily_activity' => $dailyActivity,
+                'top_users' => $topUsers,
+                'latest_log' => $latestLog,
+            ],
+        ]);
+    }
+
     private function attachUserToApp(int $userId, int $appId, string $defaultRoleName): void
     {
         $connection = DB::connection('central');
@@ -233,5 +439,22 @@ class AuthController extends Controller
                 ];
             })
             ->values();
+    }
+
+    private function authActivityLogsQuery(): \Illuminate\Database\Query\Builder
+    {
+        return DB::connection('central')
+            ->table('activity_logs as logs')
+            ->leftJoin('mst_user as users', 'users.id', '=', 'logs.user_id')
+            ->leftJoin('mst_profiles as profiles', 'profiles.user_id', '=', 'users.id')
+            ->where(function ($query) {
+                $query->where('logs.module', 'auth')
+                    ->orWhere('logs.action', 'like', 'auth.%');
+            });
+    }
+
+    private function canAccessLogs(?string $role): bool
+    {
+        return in_array($role, ['admin', 'superadmin'], true);
     }
 }

@@ -39,7 +39,8 @@ class JwtService
         return [
             'token_type' => 'Bearer',
             'access_token' => $this->encodeAccessToken($user, $appId, $sessionId, $role, $accessExpiresAt, $now),
-            'expires_in' => $accessExpiresAt->diffInSeconds($now),
+
+            'expires_in' => $now->diffInSeconds($accessExpiresAt),
             'refresh_token' => $refreshToken,
             'refresh_token_expires_at' => $refreshExpiresAt->toIso8601String(),
             'session_id' => $sessionId,

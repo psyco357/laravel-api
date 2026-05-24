@@ -5,6 +5,7 @@ namespace App\Providers;
 use App\Services\JwtService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -24,6 +25,14 @@ class AppServiceProvider extends ServiceProvider
     {
         Auth::viaRequest('jwt', function (Request $request) {
             return app(JwtService::class)->authenticate($request);
+        });
+
+        Gate::before(function ($user, string $ability) {
+            if (! method_exists($user, 'hasPermission')) {
+                return null;
+            }
+
+            return $user->hasPermission($ability) ? true : null;
         });
     }
 }
